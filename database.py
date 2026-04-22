@@ -14,7 +14,14 @@ class Database:
         return conn
 
     def init(self):
-        """Створює таблиці, якщо їх ще немає."""
+        """Створює таблиці, якщо їх ще немає.
+
+        INTEGER PRIMARY KEY AUTOINCREMENT гарантує, що номери
+        оголошень і заявок завжди ЗРОСТАЮТЬ (1, 2, 3, …) і ніколи
+        не повторюються — навіть якщо попереднє оголошення закрите
+        або рядок видалено. Це саме те, що треба для номерів
+        #690 → #691 → #692.
+        """
         with self._conn() as c:
             c.executescript(
                 """
@@ -55,10 +62,17 @@ class Database:
                     phone TEXT,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 );
+
+                CREATE TABLE IF NOT EXISTS admins (
+                    user_id INTEGER PRIMARY KEY,
+                    username TEXT,
+                    first_name TEXT,
+                    added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
                 """
             )
 
-    # ---------- Offers ----------
+    # ──────────── Offers ────────────
 
     def create_offer(self, **fields) -> int:
         with self._conn() as c:
@@ -113,7 +127,7 @@ class Database:
                 ).fetchall()
             return [dict(r) for r in rows]
 
-    # ---------- Proposals ----------
+    # ──────────── Proposals ────────────
 
     def get_or_create_proposal(
         self, offer_id: int, user_id: int, username: str, first_name: str
@@ -129,9 +143,16 @@ class Database:
                 (offer_id, user_id),
             ).fetchone()
             if row:
+                # Оновлюємо username/first_name на свіжі
+                c.execute(
+                    "UPDATE proposals SET username=?, first_name=? WHERE id=?",
+                    (username, first_name, row["id"]),
+                )
+                row = c.execute(
+                    "SELECT * FROM proposals WHERE id=?", (row["id"],)
+                ).fetchone()
                 return row["id"], dict(row)
 
-            # Забираємо phone із users, якщо був раніше переданий
             user_row = c.execute(
                 "SELECT phone FROM users WHERE user_id=?", (user_id,)
             ).fetchone()
@@ -192,7 +213,7 @@ class Database:
             ).fetchone()
             return row["c"] if row else 0
 
-    # ---------- Users ----------
+    # ──────────── Users ────────────
 
     def upsert_user(self, user_id: int, username: str, first_name: str):
         with self._conn() as c:
@@ -215,8 +236,49 @@ class Database:
                        updated_at=CURRENT_TIMESTAMP""",
                 (user_id, phone),
             )
-            # Розповсюджуємо номер на існуючі пропозиції
             c.execute(
-                "UPDATE proposals SET phone=? WHERE user_id=? AND phone IS NULL",
+                "UPDATE proposals SET phone=? WHERE user_id=? AND "
+                "(phone IS NULL OR phone='')",
                 (phone, user_id),
             )
+
+    def get_user(self, user_id: int) -> Optional[dict]:
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT * FROM users WHERE user_id=?", (user_id,)
+            ).fetchone()
+            return dict(row) if row else None
+
+    # ──────────── Admins ────────────
+
+    def add_admin(
+        self, user_id: int, username: str = "", first_name: str = ""
+    ):
+        with self._conn() as c:
+            c.execute(
+                """INSERT INTO admins (user_id, username, first_name)
+                   VALUES (?, ?, ?)
+                   ON CONFLICT(user_id) DO UPDATE SET
+                       username=excluded.username,
+                       first_name=excluded.first_name""",
+                (user_id, username, first_name),
+            )
+
+    def remove_admin(self, user_id: int) -> bool:
+        with self._conn() as c:
+            cur = c.execute("DELETE FROM admins WHERE user_id=?", (user_id,))
+            return cur.rowcount > 0
+
+    def is_admin_db(self, user_id: int) -> bool:
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT 1 FROM admins WHERE user_id=?", (user_id,)
+            ).fetchone()
+            return row is not None
+
+    def list_admins(self) -> list:
+        with self._conn() as c:
+            rows = c.execute(
+                "SELECT * FROM admins ORDER BY added_at"
+            ).fetchall()
+            return [dict(r) for r in rows]
