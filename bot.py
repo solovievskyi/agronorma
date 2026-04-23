@@ -278,7 +278,7 @@ def parse_tonnage(text: str) -> Optional[float]:
         v = float(cleaned)
     except ValueError:
         return None
-    if 0 < v <= 100:
+    if 0 < v <= 100000:
         return v
     return None
 
@@ -1139,7 +1139,7 @@ async def new_weight(message: Message, state: FSMContext):
         return await _universal_cancel(message, state)
     w = parse_tonnage(message.text or "")
     if not w:
-        await message.answer("Введіть число тонн від 0 до 100 (напр. 25).")
+        await message.answer("Введіть число тонн від 0 до 100000 (напр. 99777).")
         return
     await state.update_data(weight_t=w)
     await state.set_state(NewOfferStates.load_date)
@@ -1866,7 +1866,7 @@ async def edit_new_value(message: Message, state: FSMContext):
     if field == "weight_t":
         parsed = parse_tonnage(value)
         if not parsed:
-            await message.answer("Некоректна вага. Введіть число 0-100.")
+            await message.answer("Некоректна вага. Введіть число 0-100000.")
             return
         value = parsed
     elif field == "contact_phone":
