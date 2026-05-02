@@ -57,8 +57,6 @@ SUPER_ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 CHANNEL_ID = int(os.getenv("CHANNEL_ID", "0"))
 BOT_USERNAME = os.getenv("BOT_USERNAME", "").lstrip("@")
 DB_PATH = os.getenv("DB_PATH", "bot.db")
-AUTO_CLOSE_HOURS = int(os.getenv("AUTO_CLOSE_HOURS", "48"))
-REMINDER_BEFORE_HOURS = int(os.getenv("REMINDER_BEFORE_HOURS", "2"))
 BACKUP_HOUR_KYIV = int(os.getenv("BACKUP_HOUR_KYIV", "9"))  # 09:00 за Києвом
 LOG_FILE = os.getenv("LOG_FILE", "bot.log")
 
@@ -107,6 +105,7 @@ class NewOfferStates(StatesGroup):
     contact_name = State()
     contact_phone = State()
     photo = State()
+    deadline = State()
     confirm = State()
 
 
@@ -152,6 +151,9 @@ BTN_CANCEL = "❌ Скасувати"
 BTN_SKIP = "⏭ Пропустити"
 BTN_CONFIRM = "✅ Опублікувати"
 BTN_SHARE_PHONE = "📞 Поділитись номером"
+
+# Київ ≈ UTC+3 (літо). На Railway час UTC.
+KYIV_OFFSET_HOURS = 3
 
 
 # ────────────────────  Права доступу  ────────────────────
@@ -268,6 +270,53 @@ def parse_phone(text: str) -> Optional[str]:
     return "+" + digits
 
 
+def parse_deadline_kyiv(text: str) -> Optional[datetime]:
+    """Парсить дату/час, введені користувачем у Київському поясі.
+    Підтримує:
+      - DD.MM.YYYY HH:MM (напр. 25.04.2026 18:00)
+      - DD.MM HH:MM      (рік підставляється поточний)
+    Повертає datetime у UTC або None, якщо формат невірний / дата минула."""
+    if not text:
+        return None
+    text = text.strip().replace("/", ".").replace("-", ".")
+    # Дозволяємо одиничні цифри: 5.4 18:0
+    fmts = [
+        "%d.%m.%Y %H:%M",
+        "%d.%m.%y %H:%M",
+        "%d.%m %H:%M",
+    ]
+    dt_local = None
+    for fmt in fmts:
+        try:
+            dt_local = datetime.strptime(text, fmt)
+            if "%Y" not in fmt and "%y" not in fmt:
+                # без року — підставляємо поточний за Києвом
+                kyiv_now = datetime.utcnow() + timedelta(hours=KYIV_OFFSET_HOURS)
+                dt_local = dt_local.replace(year=kyiv_now.year)
+            break
+        except ValueError:
+            continue
+    if not dt_local:
+        return None
+    dt_utc = dt_local - timedelta(hours=KYIV_OFFSET_HOURS)
+    if dt_utc <= datetime.utcnow() + timedelta(minutes=5):
+        return None  # минула або занадто близька
+    return dt_utc
+
+
+def fmt_deadline_kyiv(dt_utc_str: Optional[str]) -> str:
+    """Повертає '25.04.2026 18:00 (Київ)' для UTC-стрічки з БД,
+    або '—' якщо None / помилка парсингу."""
+    if not dt_utc_str:
+        return "—"
+    try:
+        dt_utc = datetime.strptime(dt_utc_str[:19], "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return dt_utc_str[:16]
+    dt_kyiv = dt_utc + timedelta(hours=KYIV_OFFSET_HOURS)
+    return dt_kyiv.strftime("%d.%m.%Y %H:%M") + " (Київ)"
+
+
 def parse_tonnage(text: str) -> Optional[float]:
     if not text:
         return None
@@ -310,7 +359,7 @@ def format_offer_for_channel(offer: dict) -> str:
     if offer.get("auto_close_at"):
         close_at = (
             f"\n⏳ Приймаємо пропозиції до "
-            f"{html_escape(offer['auto_close_at'][:16])}"
+            f"{html_escape(fmt_deadline_kyiv(offer['auto_close_at']))}"
         )
     return (
         f"<b>Оголошення #{offer['id']}</b> — {status}\n"
@@ -437,6 +486,8 @@ def new_offer_skip_keyboard() -> ReplyKeyboardMarkup:
         ],
         resize_keyboard=True,
     )
+
+
 
 
 def confirm_offer_keyboard() -> ReplyKeyboardMarkup:
@@ -1088,7 +1139,7 @@ async def _start_new_offer(message: Message, state: FSMContext):
     await state.clear()
     await state.set_state(NewOfferStates.route_from)
     await message.answer(
-        "<b>Нове оголошення — крок 1/9.</b>\n"
+        "<b>Нове оголошення — крок 1/10.</b>\n"
         "Маршрут <b>ВІД</b> (звідки вантаж, напр. <code>Київ, Київська обл.</code>):",
         reply_markup=new_offer_keyboard(),
     )
@@ -1114,7 +1165,7 @@ async def new_route_from(message: Message, state: FSMContext):
         return await _universal_cancel(message, state)
     await state.update_data(route_from=message.text.strip())
     await state.set_state(NewOfferStates.route_to)
-    await message.answer("Крок 2/9. Маршрут <b>ДО</b>:")
+    await message.answer("Крок 2/10. Маршрут <b>ДО</b>:")
 
 
 @router.message(NewOfferStates.route_to)
@@ -1124,7 +1175,7 @@ async def new_route_to(message: Message, state: FSMContext):
     await state.update_data(route_to=message.text.strip())
     await state.set_state(NewOfferStates.cargo)
     await message.answer(
-        "Крок 3/9. <b>Вантаж</b> (напр. <code>Пшениця 3-го класу</code>):"
+        "Крок 3/10. <b>Вантаж</b> (напр. <code>Пшениця 3-го класу</code>):"
     )
 
 
@@ -1134,7 +1185,7 @@ async def new_cargo(message: Message, state: FSMContext):
         return await _universal_cancel(message, state)
     await state.update_data(cargo=message.text.strip())
     await state.set_state(NewOfferStates.weight)
-    await message.answer("Крок 4/9. <b>Вага, тонн</b> (напр. <code>25</code>):")
+    await message.answer("Крок 4/10. <b>Вага, тонн</b> (напр. <code>25</code>):")
 
 
 @router.message(NewOfferStates.weight)
@@ -1148,7 +1199,7 @@ async def new_weight(message: Message, state: FSMContext):
     await state.update_data(weight_t=w)
     await state.set_state(NewOfferStates.load_date)
     await message.answer(
-        "Крок 5/9. <b>Дата завантаження</b> (текстом, напр. "
+        "Крок 5/10. <b>Дата завантаження</b> (текстом, напр. "
         "<code>25.04.2026</code>). Можна пропустити.",
         reply_markup=new_offer_skip_keyboard(),
     )
@@ -1162,7 +1213,7 @@ async def new_load_date(message: Message, state: FSMContext):
     await state.update_data(load_date=date)
     await state.set_state(NewOfferStates.extra_info)
     await message.answer(
-        "Крок 6/9. <b>Додаткова інформація</b> (особливості, вимоги до авто тощо). "
+        "Крок 6/10. <b>Додаткова інформація</b> (особливості, вимоги до авто тощо). "
         "Можна пропустити.",
         reply_markup=new_offer_skip_keyboard(),
     )
@@ -1176,7 +1227,7 @@ async def new_extra(message: Message, state: FSMContext):
     await state.update_data(extra_info=extra)
     await state.set_state(NewOfferStates.contact_name)
     await message.answer(
-        "Крок 7/9. <b>Контактна особа</b> (кому передзвонить перевізник, якщо захочете). "
+        "Крок 7/10. <b>Контактна особа</b> (кому передзвонить перевізник, якщо захочете). "
         "Можна пропустити.",
         reply_markup=new_offer_skip_keyboard(),
     )
@@ -1190,7 +1241,7 @@ async def new_contact_name(message: Message, state: FSMContext):
     await state.update_data(contact_name=cname)
     await state.set_state(NewOfferStates.contact_phone)
     await message.answer(
-        "Крок 8/9. <b>Телефон контактної особи</b>. Можна пропустити.",
+        "Крок 8/10. <b>Телефон контактної особи</b>. Можна пропустити.",
         reply_markup=new_offer_skip_keyboard(),
     )
 
@@ -1212,7 +1263,7 @@ async def new_contact_phone(message: Message, state: FSMContext):
         await state.update_data(contact_phone=phone)
     await state.set_state(NewOfferStates.photo)
     await message.answer(
-        "Крок 9/9. <b>Фото вантажу</b> (надішліть зображення). Можна пропустити.",
+        "Крок 9/10. <b>Фото вантажу</b> (надішліть зображення). Можна пропустити.",
         reply_markup=new_offer_skip_keyboard(),
     )
 
@@ -1221,7 +1272,7 @@ async def new_contact_phone(message: Message, state: FSMContext):
 async def new_photo(message: Message, state: FSMContext):
     file_id = message.photo[-1].file_id
     await state.update_data(photo_file_id=file_id)
-    await _new_offer_confirm(message, state)
+    await _ask_deadline(message, state)
 
 
 @router.message(NewOfferStates.photo)
@@ -1230,11 +1281,49 @@ async def new_photo_text(message: Message, state: FSMContext):
         return await _universal_cancel(message, state)
     if message.text == BTN_SKIP:
         await state.update_data(photo_file_id=None)
-        await _new_offer_confirm(message, state)
+        await _ask_deadline(message, state)
         return
     await message.answer(
         "Надішліть фото або натисніть «Пропустити»."
     )
+
+
+async def _ask_deadline(message: Message, state: FSMContext):
+    """Крок 10/10 — введення дедлайну прийому пропозицій (Київський час)."""
+    await state.set_state(NewOfferStates.deadline)
+    kyiv_now = datetime.utcnow() + timedelta(hours=KYIV_OFFSET_HOURS)
+    example = (kyiv_now + timedelta(hours=24)).strftime("%d.%m.%Y %H:%M")
+    await message.answer(
+        "<b>Крок 10/10. Приймаємо пропозиції до</b>\n"
+        "Введіть дату й час за <b>київським часом</b>:\n"
+        "формат <code>ДД.ММ.РРРР ГГ:ХХ</code> "
+        "(рік можна пропустити: <code>ДД.ММ ГГ:ХХ</code>).\n"
+        f"Напр.: <code>{example}</code>\n\n"
+        "Можна пропустити — тоді термін у пості показано не буде.",
+        reply_markup=new_offer_skip_keyboard(),
+    )
+
+
+@router.message(NewOfferStates.deadline)
+async def new_deadline(message: Message, state: FSMContext):
+    if message.text == BTN_CANCEL:
+        return await _universal_cancel(message, state)
+    if message.text == BTN_SKIP:
+        await state.update_data(auto_close_at=None)
+        await _new_offer_confirm(message, state)
+        return
+    dt_utc = parse_deadline_kyiv(message.text or "")
+    if not dt_utc:
+        await message.answer(
+            "Не вдалось розпізнати дату/час або вона у минулому. "
+            "Введіть у форматі <code>ДД.ММ.РРРР ГГ:ХХ</code> (Київ), "
+            "не менш ніж +5 хв від зараз. Або натисніть «⏭ Пропустити»."
+        )
+        return
+    await state.update_data(
+        auto_close_at=dt_utc.strftime("%Y-%m-%d %H:%M:%S")
+    )
+    await _new_offer_confirm(message, state)
 
 
 async def _new_offer_confirm(message: Message, state: FSMContext):
@@ -1248,6 +1337,7 @@ async def _new_offer_confirm(message: Message, state: FSMContext):
         "weight_t": data.get("weight_t"),
         "load_date": data.get("load_date"),
         "extra_info": data.get("extra_info"),
+        "auto_close_at": data.get("auto_close_at"),
     }
     contact_block = ""
     if data.get("contact_name") or data.get("contact_phone"):
@@ -1255,18 +1345,22 @@ async def _new_offer_confirm(message: Message, state: FSMContext):
             f"\n\n👤 Контакт: {html_escape(data.get('contact_name') or '—')}"
             f" · {html_escape(data.get('contact_phone') or '—')}"
         )
-    auto_close = ""
-    if AUTO_CLOSE_HOURS > 0:
-        close_at = (
-            datetime.utcnow() + timedelta(hours=AUTO_CLOSE_HOURS)
-        ).strftime("%Y-%m-%d %H:%M:%S")
-        auto_close = f"\n\n⏳ Автозакриття через {AUTO_CLOSE_HOURS} год"
+    deadline_block = ""
+    if data.get("auto_close_at"):
+        deadline_block = (
+            f"\n\n⏳ Приймаємо пропозиції до: <b>"
+            f"{html_escape(fmt_deadline_kyiv(data['auto_close_at']))}</b>"
+        )
+    else:
+        deadline_block = (
+            "\n\n♾ Без терміну (закриєте вручну, коли вирішите)"
+        )
     await state.set_state(NewOfferStates.confirm)
     await message.answer(
         "<b>Попередній перегляд:</b>\n\n"
         + format_offer_for_channel(preview)
         + contact_block
-        + auto_close
+        + deadline_block
         + "\n\nОпублікувати?",
         reply_markup=confirm_offer_keyboard(),
     )
@@ -1281,11 +1375,7 @@ async def new_confirm(message: Message, state: FSMContext):
         return
 
     data = await state.get_data()
-    auto_close_at = None
-    if AUTO_CLOSE_HOURS > 0:
-        auto_close_at = (
-            datetime.utcnow() + timedelta(hours=AUTO_CLOSE_HOURS)
-        ).strftime("%Y-%m-%d %H:%M:%S")
+    auto_close_at = data.get("auto_close_at")  # UTC string або None
 
     offer_id = db.create_offer(
         route_from=data["route_from"],
@@ -2653,52 +2743,6 @@ async def btn_stats(message: Message):
 
 
 # ────────────────────  Планувальники  ────────────────────
-async def scheduler_auto_close():
-    """Закриває оголошення, у яких минув auto_close_at + шле нагадування."""
-    while True:
-        try:
-            for offer in db.offers_pending_auto_close():
-                db.set_offer_status(offer["id"], "closed")
-                offer = db.get_offer(offer["id"])
-                await update_channel_post(offer)
-                await notify_admins(
-                    f"⏳ Оголошення #{offer['id']} автоматично закрите "
-                    f"(минув термін). Пропозицій: "
-                    f"<b>{db.count_proposals(offer['id'])}</b>."
-                )
-                logger.info("auto-closed offer %s", offer["id"])
-
-            for offer in db.offers_needing_reminder(REMINDER_BEFORE_HOURS):
-                users = db.users_without_proposal_for(offer["id"])
-                sent = 0
-                for u in users:
-                    try:
-                        await bot.send_message(
-                            u["user_id"],
-                            f"⏰ Залишилось ~{REMINDER_BEFORE_HOURS} год до "
-                            f"закриття оголошення #{offer['id']}: "
-                            f"{html_escape(offer['route_from'])} → "
-                            f"{html_escape(offer['route_to'])}.\n"
-                            f"Не забудьте подати пропозицію!\n\n"
-                            f"<a href=\"https://t.me/{BOT_USERNAME}?start=offer_{offer['id']}\">"
-                            "Відкрити оголошення</a>",
-                        )
-                        sent += 1
-                    except (TelegramForbiddenError, TelegramBadRequest):
-                        pass
-                    await asyncio.sleep(0.05)
-                db.mark_reminder_sent(offer["id"])
-                logger.info(
-                    "reminder for offer %s sent to %d users",
-                    offer["id"],
-                    sent,
-                )
-        except Exception:
-            logger.exception("scheduler_auto_close error")
-
-        await asyncio.sleep(60)
-
-
 async def scheduler_daily_backup():
     """Раз на добу (о BACKUP_HOUR_KYIV за Києвом ≈ UTC+2/3) шле БД супер-адміну."""
     # Приблизно Kyiv = UTC+3 (літо). На Railway час UTC.
@@ -2762,7 +2806,6 @@ async def main():
     db.init()
     logger.info("Старт бота…")
 
-    asyncio.create_task(scheduler_auto_close())
     asyncio.create_task(scheduler_daily_backup())
 
     await bot.delete_webhook(drop_pending_updates=True)
