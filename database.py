@@ -503,6 +503,19 @@ class Database:
             ).fetchall()
             return [r["user_id"] for r in rows]
 
+    def list_registered_users(self) -> list:
+        """Усі схвалені (зареєстровані) перевізники.
+        Сортуються спочатку активні, потім за датою реєстрації (нові вгорі)."""
+        with self._conn() as c:
+            rows = c.execute(
+                """SELECT * FROM users
+                   WHERE is_registered=1
+                   ORDER BY is_blacklisted ASC,
+                            registered_at DESC,
+                            user_id DESC"""
+            ).fetchall()
+            return [dict(r) for r in rows]
+
     # ──────────── Admins ────────────
 
     def add_admin(

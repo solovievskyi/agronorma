@@ -140,6 +140,7 @@ ADMIN_BTN_ADMINS = "👥 Адміни"
 ADMIN_BTN_BROADCAST = "📢 Розсилка"
 ADMIN_BTN_STATS = "📊 Статистика"
 ADMIN_BTN_PENDING = "📝 Реєстрації"
+ADMIN_BTN_USERS = "👤 Користувачі"
 
 CARRIER_BTN_MY_PROFILE = "👤 Мій профіль"
 CARRIER_BTN_HELP = "❓ Як користуватись"
@@ -375,6 +376,9 @@ def admin_menu_keyboard(user_id: int) -> ReplyKeyboardMarkup:
         [
             KeyboardButton(text=pending_label),
             KeyboardButton(text=ADMIN_BTN_STATS),
+        ],
+        [
+            KeyboardButton(text=ADMIN_BTN_USERS),
         ],
     ]
     if is_super_admin(user_id):
@@ -1957,6 +1961,159 @@ async def cmd_pending(message: Message):
     if not is_admin(message.from_user.id):
         return
     await _show_pending_registrations(message)
+
+
+# ────────────────────  Список користувачів  ────────────────────
+def _users_list_inline() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="📥 Завантажити Excel",
+                    callback_data="users_excel",
+                )
+            ]
+        ]
+    )
+
+
+async def _show_registered_users(message: Message):
+    users = db.list_registered_users()
+    if not users:
+        await message.answer(
+            "Немає зареєстрованих користувачів.",
+            reply_markup=admin_menu_keyboard(message.from_user.id),
+        )
+        return
+
+    active = [u for u in users if not u.get("is_blacklisted")]
+    blocked = [u for u in users if u.get("is_blacklisted")]
+
+    header = (
+        f"<b>👤 Зареєстровані користувачі</b>\n"
+        f"Всього: <b>{len(users)}</b> "
+        f"(активні: {len(active)}, у чорному списку: {len(blocked)})"
+    )
+
+    # Список може бути довгим — розбиваємо на чанки по 20
+    lines: list[str] = []
+    for u in users:
+        link = user_profile_link(
+            u["user_id"], u.get("username"), u.get("first_name")
+        )
+        bl = " 🚫" if u.get("is_blacklisted") else ""
+        wins = u.get("wins_count", 0)
+        total = u.get("total_proposals", 0)
+        full = html_escape(u.get("full_name") or "")
+        phone = html_escape(u.get("phone") or "—")
+        edrpou = html_escape(u.get("edrpou") or "—")
+        lines.append(
+            f"• {link}{bl}\n"
+            f"   {full}\n"
+            f"   📞 <code>{phone}</code> · 🧾 <code>{edrpou}</code>\n"
+            f"   📈 {wins} перемог / {total} заявок"
+        )
+
+    # Перше повідомлення — з шапкою
+    await message.answer(header)
+
+    # Далі — чанками
+    chunk_size = 15
+    chunks = [lines[i:i + chunk_size] for i in range(0, len(lines), chunk_size)]
+    last_idx = len(chunks) - 1
+    for i, chunk in enumerate(chunks):
+        text = "\n\n".join(chunk)
+        # Кнопка Excel — лише в останньому повідомленні
+        kb = _users_list_inline() if i == last_idx else None
+        await message.answer(text, reply_markup=kb)
+
+
+@router.message(F.text == ADMIN_BTN_USERS)
+async def btn_users(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    await _show_registered_users(message)
+
+
+@router.message(Command("users"))
+async def cmd_users(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    await _show_registered_users(message)
+
+
+@router.callback_query(F.data == "users_excel")
+async def cb_users_excel(cb: CallbackQuery):
+    if not is_admin(cb.from_user.id):
+        await cb.answer()
+        return
+    await cb.answer("Готую Excel…")
+
+    from openpyxl import Workbook
+    from openpyxl.styles import Alignment, Font, PatternFill
+    from openpyxl.utils import get_column_letter
+
+    users = db.list_registered_users()
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Користувачі"
+
+    bold = Font(bold=True)
+    hdr_fill = PatternFill("solid", fgColor="DDE6F0")
+    wrap = Alignment(wrap_text=True, vertical="top")
+
+    # Шапка
+    ws["A1"] = (
+        f"Зареєстровані користувачі ({len(users)})"
+    )
+    ws["A1"].font = Font(bold=True, size=14)
+    ws.merge_cells("A1:I1")
+
+    headers = [
+        "User ID", "Username", "Ім'я в TG",
+        "ПІБ / Назва", "Телефон", "ЄДРПОУ/ІПН",
+        "Перемог", "Заявок", "Статус",
+    ]
+    row = 3
+    for i, h in enumerate(headers, 1):
+        cell = ws.cell(row=row, column=i, value=h)
+        cell.font = bold
+        cell.fill = hdr_fill
+    row += 1
+
+    for u in users:
+        status = "🚫 У чорному списку" if u.get("is_blacklisted") else "✅ Активний"
+        ws.cell(row=row, column=1, value=u.get("user_id"))
+        ws.cell(
+            row=row, column=2,
+            value=f"@{u['username']}" if u.get("username") else "",
+        )
+        ws.cell(row=row, column=3, value=u.get("first_name") or "")
+        ws.cell(row=row, column=4, value=u.get("full_name") or "")
+        ws.cell(row=row, column=5, value=u.get("phone") or "")
+        ws.cell(row=row, column=6, value=u.get("edrpou") or "")
+        ws.cell(row=row, column=7, value=u.get("wins_count", 0))
+        ws.cell(row=row, column=8, value=u.get("total_proposals", 0))
+        ws.cell(row=row, column=9, value=status)
+        row += 1
+
+    widths = [12, 18, 18, 28, 18, 14, 10, 10, 22]
+    for i, w in enumerate(widths, 1):
+        ws.column_dimensions[get_column_letter(i)].width = w
+
+    for r in ws.iter_rows(min_row=1, max_row=row - 1):
+        for c in r:
+            c.alignment = wrap
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    filename = f"users_{len(users)}.xlsx"
+    await cb.message.answer_document(
+        BufferedInputFile(buf.read(), filename=filename),
+        caption=f"Зареєстровані користувачі — {len(users)}",
+    )
 
 
 @router.callback_query(F.data.startswith("approve:"))
