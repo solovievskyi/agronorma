@@ -23,7 +23,8 @@ import logging
 import os
 import re
 import traceback
-from datetime import datetime, timedelta
+from calendar import monthrange
+from datetime import date, datetime, timedelta
 from typing import Optional
 
 from aiogram import Bot, Dispatcher, F, Router
@@ -154,6 +155,12 @@ BTN_SHARE_PHONE = "📞 Поділитись номером"
 
 # Київ ≈ UTC+3 (літо). На Railway час UTC.
 KYIV_OFFSET_HOURS = 3
+
+MONTH_NAMES_UA = [
+    "Січень", "Лютий", "Березень", "Квітень", "Травень", "Червень",
+    "Липень", "Серпень", "Вересень", "Жовтень", "Листопад", "Грудень",
+]
+WEEKDAY_NAMES_UA = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Нд"]
 
 
 # ────────────────────  Права доступу  ────────────────────
@@ -488,6 +495,157 @@ def new_offer_skip_keyboard() -> ReplyKeyboardMarkup:
     )
 
 
+# ──────────── Inline-календар для вибору дати/часу ────────────
+
+def calendar_day_keyboard(year: int, month: int) -> InlineKeyboardMarkup:
+    """Сітка днів місяця. Минулі дні не клікаються."""
+    # Нормалізація переходу між роками
+    if month < 1:
+        year, month = year - 1, 12
+    elif month > 12:
+        year, month = year + 1, 1
+
+    rows: list[list[InlineKeyboardButton]] = []
+    # Шапка: ◀  Місяць Рік  ▶
+    rows.append([
+        InlineKeyboardButton(
+            text="◀", callback_data=f"cal:nav:{year}:{month - 1}"
+        ),
+        InlineKeyboardButton(
+            text=f"{MONTH_NAMES_UA[month - 1]} {year}",
+            callback_data="cal:noop",
+        ),
+        InlineKeyboardButton(
+            text="▶", callback_data=f"cal:nav:{year}:{month + 1}"
+        ),
+    ])
+    # Дні тижня
+    rows.append([
+        InlineKeyboardButton(text=d, callback_data="cal:noop")
+        for d in WEEKDAY_NAMES_UA
+    ])
+    # Сітка днів
+    first_weekday, days_in_month = monthrange(year, month)
+    today_kyiv = (
+        datetime.utcnow() + timedelta(hours=KYIV_OFFSET_HOURS)
+    ).date()
+
+    cells: list[InlineKeyboardButton] = []
+    # Порожні клітинки до 1-го числа
+    for _ in range(first_weekday):
+        cells.append(InlineKeyboardButton(text=" ", callback_data="cal:noop"))
+    for d in range(1, days_in_month + 1):
+        cur_date = date(year, month, d)
+        if cur_date < today_kyiv:
+            cells.append(
+                InlineKeyboardButton(text="·", callback_data="cal:noop")
+            )
+        else:
+            label = f"·{d}·" if cur_date == today_kyiv else str(d)
+            cells.append(InlineKeyboardButton(
+                text=label,
+                callback_data=f"cal:day:{year}:{month}:{d}",
+            ))
+    # Доповнюємо до повного ряду
+    while len(cells) % 7:
+        cells.append(InlineKeyboardButton(text=" ", callback_data="cal:noop"))
+    for i in range(0, len(cells), 7):
+        rows.append(cells[i:i + 7])
+    # Низ
+    rows.append([
+        InlineKeyboardButton(
+            text="⏭ Без терміну", callback_data="cal:skip"
+        ),
+        InlineKeyboardButton(
+            text="❌ Скасувати", callback_data="cal:cancel"
+        ),
+    ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def calendar_hour_keyboard(year: int, month: int, day: int) -> InlineKeyboardMarkup:
+    """Сітка 0-23. Якщо день = сьогодні, минулі години не клікаються."""
+    rows: list[list[InlineKeyboardButton]] = []
+    rows.append([InlineKeyboardButton(
+        text=f"📅 {day:02d}.{month:02d}.{year} — оберіть годину",
+        callback_data="cal:noop",
+    )])
+    today_kyiv = (
+        datetime.utcnow() + timedelta(hours=KYIV_OFFSET_HOURS)
+    )
+    is_today = (
+        date(year, month, day) == today_kyiv.date()
+    )
+    min_hour = today_kyiv.hour if is_today else 0
+    # 4 ряди × 6 годин = 24
+    for r in range(4):
+        row = []
+        for c in range(6):
+            h = r * 6 + c
+            if h < min_hour:
+                row.append(InlineKeyboardButton(
+                    text="·", callback_data="cal:noop"
+                ))
+            else:
+                row.append(InlineKeyboardButton(
+                    text=f"{h:02d}",
+                    callback_data=f"cal:hour:{year}:{month}:{day}:{h}",
+                ))
+        rows.append(row)
+    rows.append([
+        InlineKeyboardButton(
+            text="◀ Інша дата",
+            callback_data=f"cal:nav:{year}:{month}",
+        ),
+        InlineKeyboardButton(
+            text="❌ Скасувати", callback_data="cal:cancel"
+        ),
+    ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def calendar_minute_keyboard(
+    year: int, month: int, day: int, hour: int
+) -> InlineKeyboardMarkup:
+    """Хвилини з кроком 5."""
+    rows: list[list[InlineKeyboardButton]] = []
+    rows.append([InlineKeyboardButton(
+        text=f"📅 {day:02d}.{month:02d}.{year}  {hour:02d}:??",
+        callback_data="cal:noop",
+    )])
+    minutes = [0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55]
+    today_kyiv = (
+        datetime.utcnow() + timedelta(hours=KYIV_OFFSET_HOURS)
+    )
+    is_now_hour = (
+        date(year, month, day) == today_kyiv.date()
+        and hour == today_kyiv.hour
+    )
+    min_minute = today_kyiv.minute + 5 if is_now_hour else 0
+    for r in range(3):
+        row = []
+        for c in range(4):
+            m = minutes[r * 4 + c]
+            if m < min_minute:
+                row.append(InlineKeyboardButton(
+                    text="·", callback_data="cal:noop"
+                ))
+            else:
+                row.append(InlineKeyboardButton(
+                    text=f":{m:02d}",
+                    callback_data=f"cal:min:{year}:{month}:{day}:{hour}:{m}",
+                ))
+        rows.append(row)
+    rows.append([
+        InlineKeyboardButton(
+            text="◀ Інша година",
+            callback_data=f"cal:back2hour:{year}:{month}:{day}",
+        ),
+        InlineKeyboardButton(
+            text="❌ Скасувати", callback_data="cal:cancel"
+        ),
+    ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def confirm_offer_keyboard() -> ReplyKeyboardMarkup:
@@ -1289,41 +1447,149 @@ async def new_photo_text(message: Message, state: FSMContext):
 
 
 async def _ask_deadline(message: Message, state: FSMContext):
-    """Крок 10/10 — введення дедлайну прийому пропозицій (Київський час)."""
+    """Крок 10/10 — вибір дедлайну прийому пропозицій (Київський час).
+    Календар inline + опція ввести текстом / пропустити."""
     await state.set_state(NewOfferStates.deadline)
     kyiv_now = datetime.utcnow() + timedelta(hours=KYIV_OFFSET_HOURS)
-    example = (kyiv_now + timedelta(hours=24)).strftime("%d.%m.%Y %H:%M")
+    # Спочатку приберемо нижню reply-клавіатуру (буде з кнопкою «Скасувати»)
     await message.answer(
         "<b>Крок 10/10. Приймаємо пропозиції до</b>\n"
-        "Введіть дату й час за <b>київським часом</b>:\n"
-        "формат <code>ДД.ММ.РРРР ГГ:ХХ</code> "
-        "(рік можна пропустити: <code>ДД.ММ ГГ:ХХ</code>).\n"
-        f"Напр.: <code>{example}</code>\n\n"
-        "Можна пропустити — тоді термін у пості показано не буде.",
-        reply_markup=new_offer_skip_keyboard(),
+        "Оберіть <b>дату</b> у календарі (Київ).",
+        reply_markup=ReplyKeyboardMarkup(
+            keyboard=[[KeyboardButton(text=BTN_CANCEL)]],
+            resize_keyboard=True,
+        ),
+    )
+    await message.answer(
+        f"📅 {MONTH_NAMES_UA[kyiv_now.month - 1]} {kyiv_now.year}",
+        reply_markup=calendar_day_keyboard(kyiv_now.year, kyiv_now.month),
     )
 
 
 @router.message(NewOfferStates.deadline)
-async def new_deadline(message: Message, state: FSMContext):
+async def new_deadline_text(message: Message, state: FSMContext):
+    """Резервний шлях — якщо адмін все ж вписав текст замість кліку."""
     if message.text == BTN_CANCEL:
         return await _universal_cancel(message, state)
-    if message.text == BTN_SKIP:
-        await state.update_data(auto_close_at=None)
-        await _new_offer_confirm(message, state)
-        return
     dt_utc = parse_deadline_kyiv(message.text or "")
     if not dt_utc:
         await message.answer(
-            "Не вдалось розпізнати дату/час або вона у минулому. "
-            "Введіть у форматі <code>ДД.ММ.РРРР ГГ:ХХ</code> (Київ), "
-            "не менш ніж +5 хв від зараз. Або натисніть «⏭ Пропустити»."
+            "Скористайтесь календарем вище. "
+            "Або, якщо хочете ввести текстом, формат: "
+            "<code>ДД.ММ.РРРР ГГ:ХХ</code> (Київ)."
         )
         return
     await state.update_data(
         auto_close_at=dt_utc.strftime("%Y-%m-%d %H:%M:%S")
     )
     await _new_offer_confirm(message, state)
+
+
+@router.callback_query(F.data.startswith("cal:"), NewOfferStates.deadline)
+async def cb_calendar(cb: CallbackQuery, state: FSMContext):
+    parts = cb.data.split(":")
+    action = parts[1] if len(parts) > 1 else ""
+
+    if action == "noop":
+        await cb.answer()
+        return
+
+    if action == "cancel":
+        await cb.message.edit_reply_markup(reply_markup=None)
+        await cb.answer("Скасовано")
+        await state.clear()
+        await cb.message.answer(
+            "Скасовано.",
+            reply_markup=admin_menu_keyboard(cb.from_user.id),
+        )
+        return
+
+    if action == "skip":
+        await state.update_data(auto_close_at=None)
+        await cb.message.edit_text(
+            "♾ Без терміну (закриєте вручну)."
+        )
+        await cb.answer()
+        await _new_offer_confirm(cb.message, state)
+        return
+
+    if action == "nav":
+        try:
+            year, month = int(parts[2]), int(parts[3])
+        except (IndexError, ValueError):
+            await cb.answer()
+            return
+        # Не дозволяємо листати у минулі місяці
+        kyiv_now = datetime.utcnow() + timedelta(hours=KYIV_OFFSET_HOURS)
+        target_first = date(
+            year if month >= 1 else year - 1,
+            month if 1 <= month <= 12 else (12 if month < 1 else 1),
+            1,
+        )
+        cur_first = date(kyiv_now.year, kyiv_now.month, 1)
+        if target_first < cur_first:
+            await cb.answer("Минулий місяць недоступний", show_alert=False)
+            return
+        await cb.message.edit_text(
+            f"📅 Оберіть дату:",
+            reply_markup=calendar_day_keyboard(year, month),
+        )
+        await cb.answer()
+        return
+
+    if action == "day":
+        year, month, day = int(parts[2]), int(parts[3]), int(parts[4])
+        await cb.message.edit_text(
+            f"📅 {day:02d}.{month:02d}.{year}\nОберіть <b>годину</b>:",
+            reply_markup=calendar_hour_keyboard(year, month, day),
+        )
+        await cb.answer()
+        return
+
+    if action == "hour":
+        year, month, day, hour = (int(p) for p in parts[2:6])
+        await cb.message.edit_text(
+            f"📅 {day:02d}.{month:02d}.{year}  {hour:02d}:??\n"
+            f"Оберіть <b>хвилини</b>:",
+            reply_markup=calendar_minute_keyboard(year, month, day, hour),
+        )
+        await cb.answer()
+        return
+
+    if action == "back2hour":
+        year, month, day = int(parts[2]), int(parts[3]), int(parts[4])
+        await cb.message.edit_text(
+            f"📅 {day:02d}.{month:02d}.{year}\nОберіть <b>годину</b>:",
+            reply_markup=calendar_hour_keyboard(year, month, day),
+        )
+        await cb.answer()
+        return
+
+    if action == "min":
+        year, month, day, hour, minute = (int(p) for p in parts[2:7])
+        try:
+            dt_local = datetime(year, month, day, hour, minute)
+        except ValueError:
+            await cb.answer("Невірна дата", show_alert=True)
+            return
+        dt_utc = dt_local - timedelta(hours=KYIV_OFFSET_HOURS)
+        if dt_utc <= datetime.utcnow() + timedelta(minutes=5):
+            await cb.answer(
+                "Цей час уже минув або занадто близький", show_alert=True
+            )
+            return
+        await state.update_data(
+            auto_close_at=dt_utc.strftime("%Y-%m-%d %H:%M:%S")
+        )
+        await cb.message.edit_text(
+            f"⏳ Приймаємо пропозиції до: <b>"
+            f"{day:02d}.{month:02d}.{year} {hour:02d}:{minute:02d} (Київ)</b>"
+        )
+        await cb.answer("Готово")
+        await _new_offer_confirm(cb.message, state)
+        return
+
+    await cb.answer()
 
 
 async def _new_offer_confirm(message: Message, state: FSMContext):
@@ -1345,22 +1611,15 @@ async def _new_offer_confirm(message: Message, state: FSMContext):
             f"\n\n👤 Контакт: {html_escape(data.get('contact_name') or '—')}"
             f" · {html_escape(data.get('contact_phone') or '—')}"
         )
-    deadline_block = ""
-    if data.get("auto_close_at"):
-        deadline_block = (
-            f"\n\n⏳ Приймаємо пропозиції до: <b>"
-            f"{html_escape(fmt_deadline_kyiv(data['auto_close_at']))}</b>"
-        )
-    else:
-        deadline_block = (
-            "\n\n♾ Без терміну (закриєте вручну, коли вирішите)"
-        )
+    deadline_note = ""
+    if not data.get("auto_close_at"):
+        deadline_note = "\n\n♾ Без терміну (закриєте вручну, коли вирішите)"
     await state.set_state(NewOfferStates.confirm)
     await message.answer(
         "<b>Попередній перегляд:</b>\n\n"
         + format_offer_for_channel(preview)
         + contact_block
-        + deadline_block
+        + deadline_note
         + "\n\nОпублікувати?",
         reply_markup=confirm_offer_keyboard(),
     )
